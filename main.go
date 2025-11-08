@@ -83,7 +83,7 @@ func loadConfig() *Config {
 
 	config := &Config{
 		FacilitatorURL: getEnv("FACILITATOR_URL", "https://x402.org/facilitator"),
-		PayTo:          getEnv("ADDRESS", ""),
+		PayTo:          getEnv("ADDRESS", "0x31422e245ecf4c87fb425b3e4ab3530203ae375c"),
 		Network:        getEnv("NETWORK", "base-sepolia"),
 		Port:           getEnvAsInt("PORT", 3001),
 		NodeEnv:        getEnv("NODE_ENV", "development"),
