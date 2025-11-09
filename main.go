@@ -4,95 +4,87 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+
 	x402gin "x402-server/middleware"
 	"x402-server/types"
 )
 
-// Session represents a payment session
-type Session struct {
-	ID        string    `json:"id"`
-	CreatedAt time.Time `json:"createdAt"`
-	ExpiresAt time.Time `json:"expiresAt"`
-	Type      string    `json:"type"` // "24hour" or "onetime"
-	Used      *bool     `json:"used,omitempty"`
-}
-
-// SessionStore manages sessions in memory (use Redis/DB in production)
-type SessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
-}
-
-func NewSessionStore() *SessionStore {
-	return &SessionStore{
-		sessions: make(map[string]*Session),
-	}
-}
-
-func (s *SessionStore) Set(id string, session *Session) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sessions[id] = session
-}
-
-func (s *SessionStore) Get(id string) (*Session, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	session, exists := s.sessions[id]
-	return session, exists
-}
-
-func (s *SessionStore) GetAllActive() []*Session {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	now := time.Now()
-	var active []*Session
-
-	for _, session := range s.sessions {
-		isExpired := now.After(session.ExpiresAt)
-		isUsed := session.Type == "onetime" && session.Used != nil && *session.Used
-		if !isExpired && !isUsed {
-			active = append(active, session)
+// 支付中间件
+func paymentMiddleware(payTo, priceStr, network string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		walletAddress := c.GetHeader("X-Wallet-Address")
+		if walletAddress == "" {
+			c.Header("X-402-Payment-Required", "true")
+			c.Header("X-402-Amount", priceStr)
+			c.Header("X-402-Pay-To", payTo)
+			c.Header("X-402-Network", network)
+			c.AbortWithStatusJSON(http.StatusPaymentRequired, gin.H{
+				"error":           "Payment Required",
+				"price":           priceStr,
+				"paymentEndpoint": "/api/pay/image",
+			})
+			return
 		}
+		c.Set("walletAddress", strings.ToLower(walletAddress))
+		c.Next()
 	}
-
-	return active
 }
 
-// Config holds application configuration
-type Config struct {
-	FacilitatorURL string
-	PayTo          string
-	Network        string
-	Port           int
-	NodeEnv        string
-	CORSOrigins    []string
+// 解析价格
+func parsePrice(priceEnv string) (*big.Float, string) {
+	cleanPrice := strings.TrimPrefix(priceEnv, "$")
+	price, ok := new(big.Float).SetString(cleanPrice)
+	if !ok {
+		return big.NewFloat(0.1), "0.1"
+	}
+	return price, cleanPrice
 }
 
-func loadConfig() *Config {
-	godotenv.Load()
-
-	config := &Config{
-		FacilitatorURL: getEnv("FACILITATOR_URL", "https://x402.org/facilitator"),
-		PayTo:          getEnv("ADDRESS", "0x31422e245ecf4c87fb425b3e4ab3530203ae375c"),
-		Network:        getEnv("NETWORK", "base-sepolia"),
-		Port:           getEnvAsInt("PORT", 3001),
-		NodeEnv:        getEnv("NODE_ENV", "development"),
+// 生成合法 resource URL
+func getResourceURL(baseURL, path string) string {
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
 	}
+	return baseURL + path
+}
 
-	if config.PayTo == "" {
-		log.Fatal("❌ Please set your wallet ADDRESS in the .env file")
+// 开发环境专用，关闭所有跨域限制
+func devCorsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Headers", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+		c.Header("Access-Control-Expose-Headers", "*")
+		c.Header("Access-Control-Allow-Credentials", "false")
+		c.Header("Access-Control-Max-Age", "86400")
+
+		// 直接处理 OPTIONS 预检
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+
+		// 强制后置补全
+		defer func() {
+			c.Header("Access-Control-Allow-Origin", "*")
+			c.Header("Access-Control-Allow-Headers", "*")
+			c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+			c.Header("Access-Control-Expose-Headers", "*")
+			c.Header("Access-Control-Allow-Credentials", "false")
+		}()
+
+		c.Next()
 	}
-	return config
 }
 
 func getEnv(key, defaultValue string) string {
@@ -111,268 +103,156 @@ func getEnvAsInt(key string, defaultValue int) int {
 	return defaultValue
 }
 
-// setupCORS configures CORS middleware for all responses including 402 Payment Required
-func setupCORS(r *gin.Engine, config *Config) {
-	r.Use(func(c *gin.Context) {
-		origin := c.GetHeader("Origin")
+func main() {
+	godotenv.Load()
 
-		if origin != "" {
-			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
-		}
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Expose-Headers", "X-402-Payment-Required, X-402-Amount, X-402-Pay-To, X-402-Resource, X-402-Network, X-Payment, x-payment")
+	// 配置初始化
+	payTo := getEnv("ADDRESS", "")
+	if payTo == "" {
+		panic("❌ Please set your wallet ADDRESS in the .env file")
+	}
 
-		// Handle OPTIONS preflight request
-		if c.Request.Method == "OPTIONS" {
-			if origin != "" {
-				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+	network := getEnv("NETWORK", "base-sepolia")
+	port := getEnvAsInt("PORT", 3001)
+	imageUrl := getEnv("IMAGE_URL", "https://x402.taolimarket.com/pretty-girl.jpeg")
+	baseURL := getEnv("BASE_URL", "https://x402.taolimarket.com")
+	facilitatorURL := getEnv("FACILITATOR_URL", "https://x402.org/facilitator")
+	imagePriceEnv := getEnv("IMAGE_PRICE", "$0.1")
+	imagePrice, cleanPrice := parsePrice(imagePriceEnv)
+	nodeEnv := getEnv("NODE_ENV", "production")
+
+	// Gin 初始化
+	app := gin.Default()
+	if nodeEnv == "development" {
+		app.Use(devCorsMiddleware()) // 开发环境跨域全放行
+	}
+
+	// 支付状态存储
+	type UserAccess struct {
+		StartTime time.Time
+	}
+	var (
+		paidUsers = make(map[string]UserAccess)
+		mu        sync.RWMutex
+	)
+	const ViewDuration = 30 * time.Second
+
+	// 1. 免费接口：支付信息
+	app.GET("/api/payment-info", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"price":       "$" + cleanPrice,
+			"description": "支付解锁图片30秒访问权限",
+			"endpoint":    "/api/pay/image",
+			"network":     network,
+			"resource":    getResourceURL(baseURL, "/api/pay/image"),
+		})
+	})
+
+	// 2. 付费接口: 实际支付
+	app.POST("/api/pay/image",
+		x402gin.PaymentMiddleware(
+			imagePrice,
+			payTo,
+			x402gin.WithFacilitatorConfig(&types.FacilitatorConfig{URL: facilitatorURL}),
+			x402gin.WithResource(getResourceURL(baseURL, "/api/pay/image")),
+		),
+		func(c *gin.Context) {
+			walletAddress := c.GetHeader("X-Wallet-Address")
+			if walletAddress == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "X-Wallet-Address header is required"})
+				return
 			}
-			c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-			c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-402-Payment, X-Payment, x-payment, X-402-Payment-Required, access-control-expose-headers")
-			c.Writer.Header().Set("Access-Control-Expose-Headers", "X-402-Payment-Required, X-402-Amount, X-402-Pay-To, X-402-Resource, X-402-Network, X-Payment, x-payment")
-			c.Writer.Header().Set("Access-Control-Max-Age", "86400")
 
-			c.AbortWithStatus(204)
+			normalizedAddress := strings.ToLower(walletAddress)
+			mu.Lock()
+			paidUsers[normalizedAddress] = UserAccess{StartTime: time.Now()}
+			mu.Unlock()
+
+			c.JSON(http.StatusOK, gin.H{
+				"success":   true,
+				"message":   "支付成功！30秒内可访问图片",
+				"imageUrl":  imageUrl,
+				"startTime": time.Now().Format(time.RFC3339),
+				"duration":  30,
+			})
+		},
+	)
+
+	// 3. 受保护接口：图片访问
+	app.GET("/api/image", paymentMiddleware(payTo, cleanPrice, network), func(c *gin.Context) {
+		walletAddress := c.GetHeader("X-Wallet-Address")
+		log.Println("walletAddresss:", walletAddress)
+		if walletAddress == "" {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":           "需要支付才能访问",
+				"paid":            false,
+				"paymentEndpoint": "/api/pay/image",
+				"price":           "$" + cleanPrice,
+			})
 			return
 		}
 
-		c.Next()
-	})
-}
-
-func main() {
-	config := loadConfig()
-	sessionStore := NewSessionStore()
-
-	r := gin.Default()
-
-	// Setup CORS middleware (must be first to handle all responses)
-	setupCORS(r, config)
-
-	// Facilitator configuration
-	facilitatorConfig := &types.FacilitatorConfig{
-		URL: config.FacilitatorURL,
-	}
-
-	// Helper function to get resource URL for x402 payment middleware
-	getResourceURL := func(path string) string {
-		baseURL := getEnv("BASE_URL", fmt.Sprintf("http://localhost:%d", config.Port))
-		return fmt.Sprintf("%s%s", baseURL, path)
-	}
-
-	// Free endpoint - health check
-	r.GET("/api/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status":  "ok",
-			"message": "Server is running",
-			"config": gin.H{
-				"network":     config.Network,
-				"payTo":       config.PayTo,
-				"facilitator": config.FacilitatorURL,
-			},
-		})
-	})
-
-	// Free endpoint - get payment options
-	r.GET("/api/payment-options", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"options": []gin.H{
-				{
-					"name":        "24-Hour Access",
-					"endpoint":    "/api/pay/session",
-					"price":       "$1.00",
-					"description": "Get a session ID for 24 hours of unlimited access",
-				},
-				{
-					"name":        "One-Time Access",
-					"endpoint":    "/api/pay/onetime",
-					"price":       "$0.10",
-					"description": "Single use payment for immediate access",
-				},
-			},
-		})
-	})
-
-	// Paid endpoint - 24-hour session access ($1.00)
-	r.POST(
-		"/api/pay/session",
-		x402gin.PaymentMiddleware(
-			big.NewFloat(1.00),
-			config.PayTo,
-			x402gin.WithFacilitatorConfig(facilitatorConfig),
-			x402gin.WithResource(getResourceURL("/api/pay/session")),
-		),
-		func(c *gin.Context) {
-			sessionID := uuid.New().String()
-			now := time.Now()
-			expiresAt := now.Add(24 * time.Hour)
-
-			session := &Session{
-				ID:        sessionID,
-				CreatedAt: now,
-				ExpiresAt: expiresAt,
-				Type:      "24hour",
-			}
-
-			sessionStore.Set(sessionID, session)
-
-			c.JSON(200, gin.H{
-				"success":   true,
-				"sessionId": sessionID,
-				"message":   "24-hour access granted!",
-				"session": gin.H{
-					"id":        session.ID,
-					"type":      session.Type,
-					"createdAt": session.CreatedAt.Format(time.RFC3339),
-					"expiresAt": session.ExpiresAt.Format(time.RFC3339),
-					"validFor":  "24 hours",
-				},
-			})
-		},
-	)
-
-	// Paid endpoint - one-time access/payment ($0.10)
-	r.POST(
-		"/api/pay/onetime",
-		x402gin.PaymentMiddleware(
-			big.NewFloat(0.10),
-			config.PayTo,
-			x402gin.WithFacilitatorConfig(facilitatorConfig),
-			x402gin.WithResource(getResourceURL("/api/pay/onetime")),
-		),
-		func(c *gin.Context) {
-			sessionID := uuid.New().String()
-			now := time.Now()
-			expiresAt := now.Add(5 * time.Minute)
-			used := false
-
-			session := &Session{
-				ID:        sessionID,
-				CreatedAt: now,
-				ExpiresAt: expiresAt,
-				Type:      "onetime",
-				Used:      &used,
-			}
-
-			sessionStore.Set(sessionID, session)
-
-			c.JSON(200, gin.H{
-				"success":   true,
-				"sessionId": sessionID,
-				"message":   "One-time access granted!",
-				"access": gin.H{
-					"id":        session.ID,
-					"type":      session.Type,
-					"createdAt": session.CreatedAt.Format(time.RFC3339),
-					"validFor":  "5 minutes (single use)",
-				},
-			})
-		},
-	)
-
-	// Free endpoint - validate session
-	r.GET("/api/session/:sessionId", func(c *gin.Context) {
-		sessionID := c.Param("sessionId")
-		session, exists := sessionStore.Get(sessionID)
-
-		if !exists {
-			c.JSON(404, gin.H{
-				"valid": false,
-				"error": "Session not found",
+		mu.RLock()
+		userAccess, userFound := paidUsers[walletAddress]
+		mu.RUnlock()
+		log.Println("userFound:", userFound)
+		if !userFound {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":           "需要支付才能访问",
+				"paid":            false,
+				"paymentEndpoint": "/api/pay/image",
+				"price":           "$" + cleanPrice,
 			})
 			return
 		}
 
 		now := time.Now()
-		isExpired := now.After(session.ExpiresAt)
-		isUsed := session.Type == "onetime" && session.Used != nil && *session.Used
+		elapsed := now.Sub(userAccess.StartTime)
+		log.Println("elapsed:", elapsed)
+		if elapsed >= ViewDuration {
+			log.Println("------:", elapsed-ViewDuration)
+			mu.Lock()
+			delete(paidUsers, walletAddress)
+			mu.Unlock()
 
-		if isExpired || isUsed {
-			errorMsg := "Session expired"
-			if isUsed {
-				errorMsg = "One-time access already used"
-			}
-
-			usedValue := false
-			if session.Used != nil {
-				usedValue = *session.Used
-			}
-
-			c.JSON(200, gin.H{
-				"valid": false,
-				"error": errorMsg,
-				"session": gin.H{
-					"id":        session.ID,
-					"type":      session.Type,
-					"createdAt": session.CreatedAt.Format(time.RFC3339),
-					"expiresAt": session.ExpiresAt.Format(time.RFC3339),
-					"used":      usedValue,
-				},
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":           "访问已过期，请重新支付",
+				"paid":            false,
+				"expired":         true,
+				"paymentEndpoint": "/api/pay/image",
+				"price":           "$" + cleanPrice,
 			})
 			return
 		}
 
-		// Mark one-time sessions as used
-		if session.Type == "onetime" && session.Used != nil {
-			*session.Used = true
-			sessionStore.Set(sessionID, session)
-		}
+		remaining := ViewDuration - elapsed
+		log.Println("remaining:", remaining)
 
-		remainingTime := session.ExpiresAt.Sub(now).Milliseconds()
-
-		c.JSON(200, gin.H{
-			"valid": true,
-			"session": gin.H{
-				"id":            session.ID,
-				"type":          session.Type,
-				"createdAt":     session.CreatedAt.Format(time.RFC3339),
-				"expiresAt":     session.ExpiresAt.Format(time.RFC3339),
-				"remainingTime": remainingTime,
-			},
+		c.JSON(http.StatusOK, gin.H{
+			"success":          true,
+			"paid":             true,
+			"imageUrl":         imageUrl,
+			"startTime":        userAccess.StartTime.Format(time.RFC3339),
+			"remainingSeconds": int(remaining.Seconds()),
+			"totalDuration":    30,
 		})
 	})
 
-	// Free endpoint - list active sessions (for demo purposes)
-	r.GET("/api/sessions", func(c *gin.Context) {
-		activeSessions := sessionStore.GetAllActive()
+	// 启动服务器
+	fmt.Printf(`
+🖼️  x402 Image Payment Server (开发环境无限制版)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💰 收款地址: %s
+🔗 网络: %s
+🌐 端口: %d
+💵 价格: $%s
+⚠️  开发环境专用：已关闭所有跨域限制
+✅ 支持所有源、所有头、所有方法
+✅ 402/200 响应均带完整 CORS 头
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+`, payTo, network, port, cleanPrice)
 
-		sessions := make([]gin.H, 0, len(activeSessions))
-		for _, session := range activeSessions {
-			sessions = append(sessions, gin.H{
-				"id":        session.ID,
-				"type":      session.Type,
-				"createdAt": session.CreatedAt.Format(time.RFC3339),
-				"expiresAt": session.ExpiresAt.Format(time.RFC3339),
-			})
-		}
-
-		c.JSON(200, gin.H{
-			"sessions": sessions,
-		})
-	})
-
-	// Print startup message
-	fmt.Println(`
-🚀 x402 Payment Template Server
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 Accepting payments to:`, config.PayTo, `
-🔗 Network:`, config.Network, `
-🌐 Port:`, config.Port, `
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 Payment Options:
-   - 24-Hour Session: $1.00
-   - One-Time Access: $0.10
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🛠️  This is a template! Customize it for your app.
-📚 Learn more: https://x402.org
-💬 Get help: https://discord.gg/invite/cdp
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-`)
-
-	// Start server
-	addr := fmt.Sprintf(":%d", config.Port)
-	if err := r.Run(addr); err != nil {
-		log.Fatal("Failed to start server:", err)
+	if err := app.Run(":" + strconv.Itoa(port)); err != nil {
+		panic(fmt.Sprintf("❌ 服务器启动失败: %v", err))
 	}
 }
