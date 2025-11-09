@@ -114,7 +114,7 @@ func main() {
 
 	network := getEnv("NETWORK", "base-sepolia")
 	port := getEnvAsInt("PORT", 3001)
-	imageUrl := getEnv("IMAGE_URL", "https://x402.taolimarket.com/pretty-girl.jpeg")
+	imageUrl := getEnv("IMAGE_URL", "https://x402.taolimarket.com/images/pretty-girl.jpeg")
 	baseURL := getEnv("BASE_URL", "https://x402.taolimarket.com")
 	facilitatorURL := getEnv("FACILITATOR_URL", "https://x402.org/facilitator")
 	imagePriceEnv := getEnv("IMAGE_PRICE", "$0.1")
