@@ -141,7 +141,7 @@ func main() {
 	app.GET("/api/payment-info", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"price":       "$" + cleanPrice,
-			"description": "支付解锁图片30秒访问权限",
+			"description": "支付后解锁图片，获得30秒的访问权限",
 			"endpoint":    "/api/pay/image",
 			"network":     network,
 			"resource":    getResourceURL(baseURL, "/api/pay/image"),
